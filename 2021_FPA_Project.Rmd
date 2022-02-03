@@ -1,0 +1,1371 @@
+---
+title: "Time Series Forecasting for Retail Data of Walmart"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+author: "Xiao FENG, Cheng WAN, Zhichun LI, Muhan YU"
+date: "15 January 2022"
+---
+
+Import Libraries
+```{r message=FALSE, warning=FALSE, message=FALSE}
+library(tseries)
+library(R.utils)
+library(forecast)
+library(stats)
+library(grid)
+library(ggplot2)
+library(TTR)
+library(gridExtra) 
+library(dplyr)
+library(sweep)
+library(DT)
+library(lubridate)
+library(smooth)
+library(vars)
+library(zoo)
+library(randomForest)
+library(RSNNS)
+library(nnfor)
+
+```
+
+Import the Dataset
+```{r}
+data = read.csv(file='./Projectdata.csv')
+colnames(data)[1] = 'date'
+data$date = as.Date(data$date, "%Y/%m/%d")
+```
+
+# EDA
+
+We observed 0s occur as the minimal values of times series and therefore, there are missing values probably due to holidays, especially Christmas.
+```{r}
+summary(data)
+```
+
+No NaN value has been found.
+```{r}
+print(data[is.na(data)])
+```
+
+# Preprocessing
+
+We replaced 0s with the values of the next periods. With additional data of dates, we decided to add a column [event], a binary variable to indicate  whether the day is in the weekend.
+
+```{r}
+
+for (col in (2:19)) {
+data[which(data[,col] == 0), col] = data[which(data[,col] == 0)+1, col]}
+for (col in (2:19)) {
+data[which(data[,col] == 0), col] = data[which(data[,col] == 0)+1, col]}
+
+row.names(data) = data$date
+data$event = ifelse((as.POSIXlt(data$date)$wday == 6 | as.POSIXlt(data$date)$wday == 0),1,0)
+```
+
+
+# Plotting Time Series, ACF/PACF, ADF for 18 Times Series
+
+To see if a time series is stationary or not, we decided to show the ACF and PACF as well as conduct the Augmented Dickey Fuller Test for each time series. And we found that according to the ADF test results, Hobbies_CA_1, Household_1_CA_1, Household_2_CA_1, Foods_1_CA_1, Foods_2_CA_1, Foods_3_CA_1, Hobbies_CA_2, Household_1_CA_2, Household_2_CA_2, Foods_1_CA_2, Foods_3_CA_2, Household_1_CA_3, Household_2_CA_3, Foods_1_CA_3, Foods_2_CA_3, Foods_3_CA_3 appear to be stationary since the pP-values of the ADF test are all smaller than 0.05, and their ACF and PACF tend to decay with the lags increase. Whereas Foods_2_CA_2, Hobbies_CA_3 appear to be not stationary as the P-values are greater than 0.05 and their ACF and PACF still significantly greater than 0 even with greater lags. Thus, we set lambda = 'auto' to conduct Box-Cox transformation automatically for non-stationary time series.
+
+```{r fig.height=4, fig.width=4, warning=FALSE, paged.print=TRUE}
+for (col in 2:19) {
+    
+ggplot(data=data, aes(x=date, y=data[,col], group=1)) + geom_line()
+    
+acf = acf(data[,col], lag.max=60, plot=FALSE)
+plot(acf,  main = colnames(data)[col])
+pacf = pacf(data[,col], lag.max=60, plot=FALSE)  
+plot(pacf, main = colnames(data)[col])
+    
+variable = ts(data[,col], frequency = 7)
+plot(decompose(variable), col = "red")
+    
+print(adf.test(data[,col]))
+
+}
+```
+
+# Forecasting by 18 Time Series
+
+- Train-Test Split (20%) d1575 2015-05-22
+
+Firstly we adopted a universal percentage of train-test split (20%), of which the data from 2011/1/29 to 2015/5/21 is the training subset and the the data from 2015/5/22 to 2016/6/19 is the test data set. 
+
+
+```{r}
+X_train = data[1:1574, ]
+y_train_point = data[1575, ]
+y_train_hist = data[1574, ]
+
+X_train28 = data[1:1547, ]
+y_train_point28 = data[1548:1575, ]
+y_train_hist28 = data[1547:1574, ]
+
+X_test = data[1576:1968, ]
+y_test_point = data[1969, ]
+y_test_hist = data[1968, ]
+
+X_test28 = data[1576:1941, ]
+y_test_point28 = data[1942:1969, ]
+y_test_hist28 = data[1941:1968, ]
+```
+
+
+Then we fit the training subset with different models including Naive, sNaive, SES, MA (with minimal MSE from Order 2 to 5), ESX, as well as SARIMA, SARIMAX, Holt-Winters (additive), State Space Model with Random Walk (ssw_rs), Exponential Smoothing State Space Model (ets) and tbats. 
+In order to make the prediction and evaluation more convenient, we created functions: the {prediction} function containing all the models mentioned above, producing a model summary with metrics given by accuracy function of the forecast classes and predictions and the {evaluation} function including RMSE, MAE, MAPE, MASE and RMSSE.
+
+Bayesian Inference of State Space Models (ssw_rs)
+$$ y_t = \mu_t + \epsilon_t $$
+$$ \mu_{t+1} = \mu_t+ \eta_t $$
+
+- Define the prediction function for models
+
+```{r message=FALSE}
+prediction = function(h, X, y) {
+    
+    predictions = data.frame()
+    overall_summary = data.frame()
+    
+    # Define prediction outputs of each model
+    y_naive = c()
+    y_snaive = c()
+    y_ses = c()
+    y_esx = c()
+    y_sma_minmse = c()
+    y_hwa = c()
+    y_sarima = c()
+    y_sarimax = c()
+    y_ssm_rw = c()
+    y_ets = c()
+    y_tbats = c()
+    
+    
+    models = c('naive', 'snaive', 'ses', 'esx', 'sma_minmse', 'sarima', 'sarimax', 'hwa', 'ssm_rw', 'ets', 'tbats')
+    
+    for (col in 2:(ncol(X)-1)) {
+    # Define time series
+    x = ts(X[,col], frequency=7)
+    # BoxCox transformation
+    L = BoxCox.lambda(x, method="loglik")
+    
+    #adf.test(x)
+    
+    # naive
+    naive = naive(x, h=h, lambda = 'auto')
+    y_naive = append(y_naive, data.frame(naive)$Point.Forecast)
+    
+    # sNaive
+    snaive = snaive(x, h=h, lambda = 'auto')
+    y_snaive = append(y_snaive, data.frame(snaive)$Point.Forecast)
+    
+    # ses
+    ses = ses(x, type='level', h=h, lambda = 'auto')
+    y_ses = append(y_ses, data.frame(ses)$Point.Forecast)
+    
+    # esx
+    esx = es(x, xreg=ts(X$event), h=h, holdout=TRUE,silent=TRUE, lambda = 'auto')
+    y_esx = append(y_esx, esx$forecast)
+    
+    # MA
+    mse_ma = c()
+    for (k in 2:5) {
+       
+        sma = SMA(x, n=k, lambda = 'auto')
+        f=forecast(sma, level=c(80,95), h=h)
+        mse_ma = append(mse_ma, data.frame(accuracy(f))$RMSE)
+        
+    }
+    k = which.min(mse_ma) + 1
+    sma_minmse = forecast(SMA(x, n=k, lambda = 'auto'),level=c(80,95), h=h)
+    y_sma_minmse = append(y_sma_minmse, data.frame(sma_minmse)$Point.Forecast)
+    
+    # SARIMA
+    sarima = forecast::forecast(auto.arima(x, lambda = 'auto'), level=c(80,95), h=h)
+    y_sarima = append(y_sarima, data.frame(sarima)$Point.Forecast) 
+    
+    # SARIMAX
+    sarimax = forecast::forecast(auto.arima(x, xreg=X$event, lambda = 'auto'), xreg = y$event, level=c(80,95), h=h)
+    y_sarimax = append(y_sarimax, data.frame(sarimax)$Point.Forecast)
+    
+    # additive HW
+    hwa = hw(x, seasonal="additive", h=h, lambda = 'auto')
+    y_hwa = append(y_hwa, data.frame(hwa)$Point.Forecast) 
+    #hwm = hw(x, seasonal="multiplicative", h=h) 
+    
+    # SSM-Random Walk
+    ssm_rw = forecast::forecast(StructTS(x, type = 'level'),level=c(80,95), h=h, lambda = L)
+    y_ssm_rw = append(y_ssm_rw, data.frame(ssm_rw)$Point.Forecast) 
+    
+    # SSM - ES
+    ets = forecast(ets(x, model='ZZZ', lambda = 'auto'),level=c(80,95), h=h)
+    y_ets = append(y_ets, data.frame(ets)$Point.Forecast) 
+    
+    # tbats
+    tbats = forecast(tbats(x, lambda = 'auto'),level=c(80,95), h=h)
+    y_tbats = append(y_tbats, data.frame(tbats)$Point.Forecast)
+
+    # Extract Accuracy from the forecast class
+    model_summary = data.frame()
+    for (m in models) {
+        if (m == 'esx'){acc = setNames(data.frame(t(esx$accuracy))[,c(2,2,5,9)], c('RMSE', 'MAE', 'MAPE', 'MASE')) 
+                        acc$MAE = 'NA'
+                        acc$MAPE = acc$MAPE * 100
+                        }else{acc = data.frame(accuracy(eval(parse(text = m))))}
+        eva = c(colnames(X)[col], m, acc$RMSE, acc$MAE, acc$MAPE, acc$MASE, ifelse((m == 'naive' | m == 'snaive' | m == 'sma_minmse'), 'NA',ifelse(m == 'ssm_rw', data.frame(sw_glance(StructTS(x, type = 'level')))$AIC, ifelse(m == 'tbats', eval(parse(text = m))$model$AIC, ifelse(m == 'esx', data.frame(esx$ICs)$AIC[length(data.frame(esx$ICs)$AIC)],AIC(eval(parse(text = m))$model))))))
+        
+        model_summary = rbind(model_summary, eva)
+    }
+    colnames(model_summary) = c('ts','model', 'RMSE', 'MAE', 'MAPE', 'MASE', 'AIC')
+
+    overall_summary = rbind(overall_summary, model_summary)
+    print(col)
+    }
+    for (m in models) {
+    predictions = rbind(predictions, eval(parse(text = paste('y',m, sep='_'))))}
+    rownames(predictions) = models
+    datatable(overall_summary)
+    return (list(overall_summary, predictions))
+}
+```
+
+- Define the evaluation equation, including RMSE, MAE, MAPE, MASE, RMSSE
+
+The accuracy of the point forecasts will also be evaluated using the Root Mean Squared Scaled Error (RMSSE)
+
+$$RMSSE = \sqrt{\frac{1}{h}\frac{\sum_{t=n+1}^{n+h}(Y_{t}-\widehat{Y_{t}})^{2}}{\frac{1}{n-1}\sum_{t=2}^{n}(Y_{t}-Y_{t-1})^{2}}}$$
+
+
+```{r}
+rmsse = function(y_true, y_pred, y_hist) {
+    h = length(y_true)
+    n = length(y_hist)
+
+    numerator = sum((y_true - y_pred)**2)
+    denominator = 1/(n-1)*sum((y_true - y_hist)**2)
+
+    rmsse = (1/h * numerator/denominator)**0.5
+    return (rmsse) 
+}
+
+extract_y = function(y,col1,col2){
+    y2 = c()
+    for (i in col1:col2){
+    y2 = append(y2, y[,i])
+}
+return(y2)
+}
+
+evaluation = function(ground_truth, predictions, history){
+    metric = data.frame()
+    for (i in 1:nrow(predictions)) {
+    ev = c(rmse(ground_truth, extract_y(predictions[i,],1,ncol(predictions))), mae(ground_truth, extract_y(predictions[i,],1,ncol(predictions))), mape(ground_truth, extract_y(predictions[i,],1,ncol(predictions))), mase(ground_truth, extract_y(predictions[i,],1,ncol(predictions))), rmsse(ground_truth, extract_y(predictions[i,],1,ncol(predictions)), history))
+    
+    metric = rbind(metric, ev)}
+    predictions[]
+    colnames(metric) = c('RMSE', 'MAE', 'MAPE', 'MASE', 'RMSSE')
+    rownames(metric) = rownames(predictions)
+    return (metric)
+}
+```
+
+## By SKU level
+## Point Forecast h = 1
+
+Using the functions mentioned above, we conducted the one-step ahead as well as the 28-step ahead point prediction and evaluation for all the 18 time series. Answering the question in 2(g), we found that in terms of products, for Hobbies products, the performance of the esx, sma_minmse and hwa models excels the rest of the models. For Household products, esx, sma_minmse models work relatively well. For Foods products, esx, sma_minmse models still surpass the rest. We can conclude that on product level, the models esx and sma_minmse are the suitable ones. Now comparing the models on the store level, we found that for all the 3 stores, the models esx and sma_minmse still generated the least losses compared to the rest of the models.
+
+### Model Summary for One-Point Forecast in the training set (Forecast Day 1575)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_train = prediction(1, X_train, y_train_point)
+write.csv(data.frame(point_forecast_train[1]),"point_forecast_train.csv", row.names = FALSE)
+```
+
+From the training model accuracy, lower performance has been found in Food products, especially Foods_3. Regarding AIC, ssm_rw and SARIMA, SARIMAX and esx have lower AIC and may have better model fits compared to other models.
+
+```{r}
+datatable(read.csv(file='./point_forecast_train.csv'))
+```
+
+### Prediction Accuracy of One-Point in the training set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_train = rbind(data.frame(point_forecast_train[2]),(data.frame(point_forecast_train[2])[3,]+data.frame(point_forecast_train[2])[6,])/2)
+rownames(prediction_point_train)[12] = 'ses&sarima'
+write.csv(prediction_point_train,"prediction_point_train.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_train = evaluation(extract_y(y_train_point,2,19), prediction_point_train, extract_y(y_train_hist,2,19))
+datatable(metric_train)
+devtools::unload("Metrics")
+write.csv(metric_train,"metric_train.csv", row.names = TRUE)
+```
+
+We found that tbats, SARIMA, and SARIMAX have better one-point prediction accuracy scores on the training set. Among them, tbats has the best accuracy score on RMSE, MAE, MASE and RMSSE. Compared to less significant RMSE in the training, MA and ESX may overfit in the training.
+
+```{r}
+datatable(read.csv(file='./metric_train.csv',row.names = 1))
+```
+
+### Model Summary for One-Point Forecast in the testing set (Forecast Day 1969)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_test = prediction(1, X_test, y_test_point)
+write.csv(data.frame(point_forecast_test[1]),"point_forecast_test.csv", row.names = FALSE)
+```
+
+In the model summary, esx, Holt-Winters, SSM-ES and tbats better performed than other models and similarly, esx, sarima, sarimax and ssm_rw have lower AIC.
+
+```{r}
+datatable(read.csv(file='./point_forecast_test.csv'))
+```
+
+### Prediction Accuracy of One-Point in the testing set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_test = rbind(data.frame(point_forecast_test[2]),(data.frame(point_forecast_test[2])[3,]+data.frame(point_forecast_test[2])[6,])/2)
+rownames(prediction_point_test)[12] = 'ses&sarima'
+write.csv(prediction_point_test,"prediction_point_test.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_test = evaluation(extract_y(y_test_point,2,19), prediction_point_test, extract_y(y_test_hist,2,19))
+datatable(metric_test)
+devtools::unload("Metrics")
+write.csv(metric_test,"metric_test.csv", row.names = TRUE)
+```
+
+Different from the training set, the ssm_rw, ESX, and naive models have better performance on the testing set and combination of ses and SARIMA has an intermediate position.
+It is possible that while predicting one point, more ensembled methods, such as tbats, fit better with longer historical time series, whereas ssm_rw, ESX has better prediction in the short term.
+
+```{r}
+datatable(read.csv(file='./metric_test.csv',row.names = 1))
+```
+
+## Point Forecast h = 28
+### Model Summary for 28-Day Forecast in the training set (Forecast Day 1548 - 1575)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_train28 = prediction(28, X_train28, y_train_point28)
+write.csv(data.frame(point_forecast_train28[1]),"point_forecast_train28.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_train28.csv'))
+```
+
+### Prediction Accuracy of 28 Days in the training set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_train28 = rbind(data.frame(point_forecast_train28[2]),(data.frame(point_forecast_train28[2])[3,]+data.frame(point_forecast_train28[2])[6,])/2)
+rownames(prediction_point_train28)[12] = 'ses&sarima'
+write.csv(prediction_point_train28,"prediction_point_train28.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_train28 = evaluation(extract_y(y_train_point28,2,19), prediction_point_train28, extract_y(y_train_hist28,2,19))
+datatable(metric_train28)
+devtools::unload("Metrics")
+write.csv(metric_train28,"metric_train28.csv", row.names = TRUE)
+```
+
+The difference between the accuracy scores of the various models in the 28-day training set predictions is not significant.The best model given by RMSSE is naive, while the moving averages model performs best in MAE, MAPE, and MASE.
+
+```{r}
+datatable(read.csv(file='./metric_train28.csv',row.names = 1))
+```
+
+### Model Summary for 28-Day Forecast in the testing set (Forecast Day 1942 - 1969)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_test28 = prediction(28, X_test28, y_test_point28)
+write.csv(data.frame(point_forecast_test28[1]),"point_forecast_test28.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_test28.csv'))
+```
+
+### Prediction Accuracy of 28 Days in the testing set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_test28 = rbind(data.frame(point_forecast_test28[2]),(data.frame(point_forecast_test28[2])[3,]+data.frame(point_forecast_test28[2])[6,])/2)
+rownames(prediction_point_test28)[12] = 'ses&sarima'
+write.csv(prediction_point_test28,"prediction_point_test28.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_test28 = evaluation(extract_y(y_test_point28,2,19), prediction_point_test28, extract_y(y_test_hist28,2,19))
+datatable(metric_test28)
+devtools::unload("Metrics")
+write.csv(metric_test28,"metric_test28.csv", row.names = TRUE)
+```
+
+The performance of each model on the testing set is roughly the same as that on the training set.
+
+```{r}
+datatable(read.csv(file='./metric_test28.csv',row.names = 1))
+```
+
+
+# Forecasting by item & product level
+
+We made forecasts at the store and item level. Firstly, we create new columns in the data frame grouping items from the same category : 
+1. Hobbies 2. Household_1 3.Household_2  4.Foods_1 5.Foods_2 6.Foods_3
+Then we create new columns grouping items from the same store:
+1. CA_1 2.CA_2 3.CA_3
+
+```{r}
+data$Hobbies = data$Hobbies_CA_1 + data$Hobbies_CA_2 + data$Hobbies_CA_3
+data$Household_1 = data$Household_1_CA_1 + data$Household_1_CA_2 + data$Household_1_CA_3
+data$Household_2 = data$Household_2_CA_1 + data$Household_2_CA_2 + data$Household_2_CA_3
+data$Foods_1 = data$Foods_1_CA_1 + data$Foods_1_CA_2 + data$Foods_1_CA_3
+data$Foods_2 = data$Foods_2_CA_1 + data$Foods_2_CA_2 + data$Foods_2_CA_3
+data$Foods_3 = data$Foods_3_CA_1 + data$Foods_3_CA_2 + data$Foods_3_CA_3
+
+data$store_1 = data$Hobbies_CA_1 + data$Household_1_CA_1 + data$Household_2_CA_1 + data$Foods_1_CA_1 + data$Foods_2_CA_1 + data$Foods_3_CA_1
+data$store_2 = data$Hobbies_CA_2 + data$Household_1_CA_2 + data$Household_2_CA_2 + data$Foods_1_CA_2 + data$Foods_2_CA_2 + data$Foods_3_CA_2
+data$store_3 = data$Hobbies_CA_3 + data$Household_1_CA_3 + data$Household_2_CA_3 + data$Foods_1_CA_3 + data$Foods_2_CA_3 + data$Foods_3_CA_3
+
+data_product = data[, c(1,21:26,20)]
+data_store = data[, c(1,27:29,20)]
+```
+
+- Train-Test Split (20%) d1575 2015-05-22
+
+We then split the dataset into the training (80%) and test (20%) subsets as before and make forecasts using previous models and make a summary for the models performance.
+
+```{r}
+X_train_product = data_product[1:1574, ]
+y_train_point_product = data_product[1575, ]
+y_train_hist_product = data_product[1574, ]
+
+X_train28_product = data_product[1:1547, ]
+y_train_point28_product = data_product[1548:1575, ]
+y_train_hist28_product = data_product[1547:1574, ]
+
+X_test_product = data_product[1576:1968, ]
+y_test_point_product = data_product[1969, ]
+y_test_hist_product = data_product[1968, ]
+
+X_test28_product = data_product[1576:1941, ]
+y_test_point28_product = data_product[1942:1969, ]
+y_test_hist28_product = data_product[1941:1968, ]
+
+X_train_store = data_store[1:1574, ]
+y_train_point_store = data_store[1575, ]
+y_train_hist_store = data_store[1574, ]
+
+X_train28_store = data_store[1:1547, ]
+y_train_point28_store = data_store[1548:1575, ]
+y_train_hist28_store = data_store[1547:1574, ]
+
+X_test_store = data_store[1576:1968, ]
+y_test_point_store = data_store[1969, ]
+y_test_hist_store = data_store[1968, ]
+
+X_test28_store = data_store[1576:1941, ]
+y_test_point28_store = data_store[1942:1969, ]
+y_test_hist28_store = data_store[1941:1968, ]
+```
+
+## By Store
+
+## Point Forecast h = 1
+### Model Summary for One-Point Forecast in the training set (Forecast Day 1575)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_train_store = prediction(1, X_train_store, y_train_point_store)
+write.csv(data.frame(point_forecast_train_store[1]),"point_forecast_train_store.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_train_store.csv'))
+```
+
+### Prediction Accuracy of One-Point in the training set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_train_store = rbind(data.frame(point_forecast_train_store[2]),(data.frame(point_forecast_train_store[2])[3,]+data.frame(point_forecast_train_store[2])[6,])/2)
+rownames(prediction_point_train_store)[12] = 'ses&sarima'
+write.csv(prediction_point_train_store,"prediction_point_train_store.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_train_store = evaluation(extract_y(y_train_point_store,2,4), prediction_point_train_store, extract_y(y_train_hist_store,2,4))
+datatable(metric_train_store)
+devtools::unload("Metrics")
+write.csv(metric_train_store,"metric_train_store.csv", row.names = TRUE)
+```
+
+The tbats method has the best accuracy on the training set because the values of RMSE, MAE, MAPE, etc. are significantly smaller than the other methods. The naive and sNaive methods do not seem to be reliable regarding the significantly higher level of all metrics.
+
+```{r}
+datatable(read.csv(file='./metric_train_store.csv',row.names = 1))
+```
+
+### Model Summary for One-Point Forecast in the testing set (Forecast Day 1969)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_test_store = prediction(1, X_test_store, y_test_point_store)
+write.csv(data.frame(point_forecast_test_store[1]),"point_forecast_test_store.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_test_store.csv'))
+```
+
+### Prediction Accuracy of One-Point in the testing set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_test_store = rbind(data.frame(point_forecast_test_store[2]),(data.frame(point_forecast_test_store[2])[3,]+data.frame(point_forecast_test_store[2])[6,])/2)
+rownames(prediction_point_test_store)[12] = 'ses&sarima'
+write.csv(prediction_point_test_store,"prediction_point_test_store.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_test_store = evaluation(extract_y(y_test_point_store,2,4), prediction_point_test_store, extract_y(y_test_hist_store,2,4))
+datatable(metric_test_store)
+devtools::unload("Metrics")
+write.csv(metric_test_store,"metric_test_store.csv", row.names = TRUE)
+```
+
+However, when we look at the testing set, the ses & sarima, the Naive and ssm_rw perform relatively well. 
+So for point forecasts, we cannot conclude a special model which is better than the others.
+There might exist an advantage in the combination of ses and sarima in predicting shorter time series.
+
+```{r}
+datatable(read.csv(file='./metric_test_store.csv',row.names = 1))
+```
+
+## Point Forecast h = 28
+### Model Summary for 28-Day Forecast in the training set (Forecast Day 1548 - 1575)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_train28_store = prediction(28, X_train28_store, y_train_point28_store)
+write.csv(data.frame(point_forecast_train28_store[1]),"point_forecast_train28_store.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_train28_store.csv'))
+```
+
+### Prediction Accuracy of 28 Days in the training set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_train28_store = rbind(data.frame(point_forecast_train28_store[2]),(data.frame(point_forecast_train28_store[2])[3,]+data.frame(point_forecast_train28_store[2])[6,])/2)
+rownames(prediction_point_train28_store)[12] = 'ses&sarima'
+write.csv(prediction_point_train28_store,"prediction_point_train28_store.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_train28_store = evaluation(extract_y(y_train_point28_store,2,4), prediction_point_train28_store, extract_y(y_train_hist28_store,2,4))
+datatable(metric_train28_store)
+devtools::unload("Metrics")
+write.csv(metric_train28_store,"metric_train28_store.csv", row.names = TRUE)
+```
+
+On the training set, the ETS and tbats have relatively better performance and they also have good performance on the testing set. 
+
+```{r}
+datatable(read.csv(file='./metric_train28_store.csv',row.names = 1))
+```
+
+### Model Summary for 28-Day Forecast in the testing set (Forecast Day 1942 - 1969)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_test28_store = prediction(28, X_test28_store, y_test_point28_store)
+write.csv(data.frame(point_forecast_test28_store[1]),"point_forecast_test28_store.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_test28_store.csv'))
+```
+
+### Prediction Accuracy of 28 Days in the testing set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_test28_store = rbind(data.frame(point_forecast_test28_store[2]),(data.frame(point_forecast_test28_store[2])[3,]+data.frame(point_forecast_test28_store[2])[6,])/2)
+rownames(prediction_point_test28_store)[12] = 'ses&sarima'
+write.csv(prediction_point_test28_store,"prediction_point_test28_store.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_test28_store = evaluation(extract_y(y_test_point28_store,2,4), prediction_point_test28_store, extract_y(y_test_hist28_store,2,4))
+datatable(metric_test28_store)
+devtools::unload("Metrics")
+write.csv(metric_test28_store,"metric_test28_store.csv", row.names = TRUE)
+```
+
+```{r}
+datatable(read.csv(file='./metric_test28_store.csv',row.names = 1))
+```
+
+## By Product
+
+## Point Forecast h = 1
+### Model Summary for One-Point Forecast in the training set (Forecast Day 1575)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_train_product = prediction(1, X_train_product, y_train_point_product)
+write.csv(data.frame(point_forecast_train_product[1]),"point_forecast_train_product.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_train_product.csv'))
+```
+
+### Prediction Accuracy of One-Point in the training set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_train_product = rbind(data.frame(point_forecast_train_product[2]),(data.frame(point_forecast_train_product[2])[3,]+data.frame(point_forecast_train_product[2])[6,])/2)
+rownames(prediction_point_train_product)[12] = 'ses&sarima'
+write.csv(prediction_point_train_product,"prediction_point_train_product.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_train_product = evaluation(extract_y(y_train_point_product,2,7), prediction_point_train_product, extract_y(y_train_hist_product,2,7))
+datatable(metric_train_product)
+devtools::unload("Metrics")
+write.csv(metric_train_product,"metric_train_product.csv", row.names = TRUE)
+```
+
+On the training set, we found that SARIMA, SARIMAX, tbats and SES&SARIMA  have better performance with relatively low errors. 
+
+```{r}
+datatable(read.csv(file='./metric_train_product.csv',row.names = 1))
+```
+
+### Model Summary for One-Point Forecast in the testing set (Forecast Day 1969)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_test_product = prediction(1, X_test_product, y_test_point_product)
+write.csv(data.frame(point_forecast_test_product[1]),"point_forecast_test_product.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_test_product.csv'))
+```
+
+### Prediction Accuracy of One-Point in the testing set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_test_product = rbind(data.frame(point_forecast_test_product[2]),(data.frame(point_forecast_test_product[2])[3,]+data.frame(point_forecast_test_product[2])[6,])/2)
+rownames(prediction_point_test_product)[12] = 'ses&sarima'
+write.csv(prediction_point_test_product,"prediction_point_test_product.csv", row.names = FALSE)
+```
+
+On the testing set, SES&SARIMA has the lowest error. The combined method again outperformed with less historical data.
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_test_product = evaluation(extract_y(y_test_point_product,2,7), prediction_point_test_product, extract_y(y_test_hist_product,2,7))
+datatable(metric_test_product)
+devtools::unload("Metrics")
+write.csv(metric_test_product,"metric_test_product.csv", row.names = TRUE)
+```
+
+```{r}
+datatable(read.csv(file='./metric_test_product.csv',row.names = 1))
+```
+
+## Point Forecast h = 28
+### Model Summary for 28-Day Forecast in the training set (Forecast Day 1548 - 1575)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_train28_product = prediction(28, X_train28_product, y_train_point28_product)
+write.csv(data.frame(point_forecast_train28_product[1]),"point_forecast_train28_product.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_train28_product.csv'))
+```
+
+### Prediction Accuracy of 28 Days in the training set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_train28_product = rbind(data.frame(point_forecast_train28_product[2]),(data.frame(point_forecast_train28_product[2])[3,]+data.frame(point_forecast_train28_product[2])[6,])/2)
+rownames(prediction_point_train28_product)[12] = 'ses&sarima'
+write.csv(prediction_point_train28_product,"prediction_point_train28_product.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_train28_product = evaluation(extract_y(y_train_point28_product,2,7), prediction_point_train28_product, extract_y(y_train_hist28_product,2,7))
+datatable(metric_train28_product)
+devtools::unload("Metrics")
+write.csv(metric_train28_product,"metric_train28_product.csv", row.names = TRUE)
+```
+
+On the training set ESX, SARIMA, SARIMAX, tbats, HWA, tbats, ETS have good performance, and tbats seems to be the best model.
+
+```{r}
+datatable(read.csv(file='./metric_train28_product.csv',row.names = 1))
+```
+
+### Model Summary for 28-Day Forecast in the testing set (Forecast Day 1942 - 1969)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_test28_product = prediction(28, X_test28_product, y_test_point28_product)
+write.csv(data.frame(point_forecast_test28_product[1]),"point_forecast_test28_product.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_test28_product.csv'))
+```
+
+### Prediction Accuracy of 28 Days in the testing set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_test28_product = rbind(data.frame(point_forecast_test28_product[2]),(data.frame(point_forecast_test28_product[2])[3,]+data.frame(point_forecast_test28_product[2])[6,])/2)
+rownames(prediction_point_test28_product)[12] = 'ses&sarima'
+write.csv(prediction_point_test28_product,"prediction_point_test28_product.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_test28_product = evaluation(extract_y(y_test_point28_product,2,7), prediction_point_test28_product, extract_y(y_test_hist28_product,2,7))
+datatable(metric_test28_product)
+devtools::unload("Metrics")
+write.csv(metric_test28_product,"metric_test28_product.csv", row.names = TRUE)
+```
+
+On the testing set SARIMA, HWA, ETS, tbats still have good performance and tbats performs the best.
+
+```{r}
+datatable(read.csv(file='./metric_test28_product.csv',row.names = 1))
+```
+
+We can conclude that tbats seems to be a reliable model for forecasting h=28 by Product.
+We also find that tbats seems to have better performance in the case h=28.
+Moreover, it manifests that similar metrics were generated in the training and testing sets while h = 28, in contrast to distinction in performance of models in one-point forecast.
+
+## Weekly Frequency
+
+To perform weekly forecasts, we first generate a new dataset called data_weekly basically by adding the number of  products sold every seven days for each column, then we split the weekly dataset into the training and test subset.
+
+After that we performed the point forecasts one step ahead, and we found that, in terms of RMSSE, the performance of the model SARIMA and SARIMAX turned out to be the best, only 0.87 and 0.84 respectively. Whereas on the test set for one step ahead forecasts, the models sNaive and esx appeared to be more reliable. Then we wanted to make predictions for the next 28 days after the end date of the training set, we found that, in terms of RMSSE, sma_minmse, ARIMA and SARIMAX, these three models surpassed the others, with 0.92, 0.93 and 0.92 respectively. On the test set, however, the performance of these three models decreased a bit but still worked fine. We can then conclude that for the forecast of one day ahead, we recommend the sNaive and esx models and for the forecast of 28 days on a weekly basis, it’s better to use the ARIMA and SARIMAX models. Relatively different results occur with different time lags of prediction. It implies possible modification on the model selection dependent on targeting time intervals.
+
+```{r}
+weekdata = data[-c(1,2),2:19]
+data_weekly = data.frame()
+for (i in 1:281){
+  weeksum = rep(0, times=18)
+  for (n in 1:7) {
+    weeksum = weeksum + weekdata[(i-1)*7+n, ]
+    }
+  data_weekly = rbind(data_weekly, weeksum)
+}
+data_weekly$event = ifelse((month(row.names(data_weekly))==12),1,0)
+data_weekly = cbind(rownames(data_weekly), data_weekly)
+```
+
+- Train-Test Split 20%
+
+```{r}
+
+X_train_weekly = data_weekly[1:224, ]
+y_train_point_weekly = data_weekly[225, ]
+y_train_hist_weekly = data_weekly[224, ]
+
+X_train28_weekly = data_weekly[1:221, ]
+y_train_point28_weekly = data_weekly[222:225, ]
+y_train_hist28_weekly = data_weekly[221:224, ]
+
+X_test_weekly = data_weekly[226:280, ]
+y_test_point_weekly = data_weekly[281, ]
+y_test_hist_weekly = data_weekly[280, ]
+
+X_test28_weekly = data_weekly[226:277, ]
+y_test_point28_weekly = data_weekly[278:281, ]
+y_test_hist28_weekly = data_weekly[277:280, ]
+```
+
+
+## Point Forecast h = 1
+### Model Summary for One-Point Forecast in the training set (Forecast Day 1575)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_train_weekly = prediction(1, X_train_weekly, y_train_point_weekly)
+write.csv(data.frame(point_forecast_train_weekly[1]),"point_forecast_train_weekly.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_train_weekly.csv'))
+```
+
+### Prediction Accuracy of One-Point in the training set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_train_weekly = rbind(data.frame(point_forecast_train_weekly[2]),(data.frame(point_forecast_train_weekly[2])[3,]+data.frame(point_forecast_train_weekly[2])[6,])/2)
+rownames(prediction_point_train_weekly)[12] = 'ses&sarima'
+write.csv(prediction_point_train_weekly,"prediction_point_train_weekly.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_train_weekly = evaluation(extract_y(y_train_point_weekly,2,19), prediction_point_train_weekly, extract_y(y_train_hist_weekly,2,19))
+datatable(metric_train_weekly)
+devtools::unload("Metrics")
+write.csv(metric_train_weekly,"metric_train_weekly.csv", row.names = TRUE)
+```
+
+```{r}
+datatable(read.csv(file='./metric_train_weekly.csv',row.names = 1))
+```
+
+### Model Summary for One-Point Forecast in the testing set (Forecast Day 1969)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_test_weekly = prediction(1, X_test_weekly, y_test_point_weekly)
+write.csv(data.frame(point_forecast_test_weekly[1]),"point_forecast_test_weekly.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_test_weekly.csv'))
+```
+
+### Prediction Accuracy of One-Point in the testing set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_test_weekly = rbind(data.frame(point_forecast_test_weekly[2]),(data.frame(point_forecast_test_weekly[2])[3,]+data.frame(point_forecast_test_weekly[2])[6,])/2)
+rownames(prediction_point_test_weekly)[12] = 'ses&sarima'
+write.csv(prediction_point_test_weekly,"prediction_point_test_weekly.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_test_weekly = evaluation(extract_y(y_test_point_weekly,2,19), prediction_point_test_weekly, extract_y(y_test_hist_weekly,2,19))
+datatable(metric_test_weekly)
+devtools::unload("Metrics")
+write.csv(metric_test_weekly,"metric_test_weekly.csv", row.names = TRUE)
+```
+
+```{r}
+datatable(read.csv(file='./metric_test_weekly.csv',row.names = 1))
+```
+
+## Point Forecast h = 4
+### Model Summary for 28-Day Forecast in the training set (Forecast Day 1548 - 1575)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_train28_weekly = prediction(4, X_train28_weekly, y_train_point28_weekly)
+write.csv(data.frame(point_forecast_train28_weekly[1]),"point_forecast_train28_weekly.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_train28_weekly.csv'))
+```
+
+### Prediction Accuracy of 28 Days in the training set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_train28_weekly = rbind(data.frame(point_forecast_train28_weekly[2]),(data.frame(point_forecast_train28_weekly[2])[3,]+data.frame(point_forecast_train28_weekly[2])[6,])/2)
+rownames(prediction_point_train28_weekly)[12] = 'ses&sarima'
+write.csv(prediction_point_train28_weekly,"prediction_point_train28_weekly.csv", row.names = FALSE)
+```
+
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_train28_weekly = evaluation(extract_y(y_train_point28_weekly,2,19), prediction_point_train28_weekly, extract_y(y_train_hist28_weekly,2,19))
+datatable(metric_train28_weekly)
+devtools::unload("Metrics")
+write.csv(metric_train28_weekly,"metric_train28_weekly.csv", row.names = TRUE)
+```
+
+```{r}
+datatable(read.csv(file='./metric_train28_weekly.csv',row.names = 1))
+```
+
+### Model Summary for 28-Day Forecast in the testing set (Forecast Day 1942 - 1969)
+
+```{r eval=FALSE, message=FALSE}
+point_forecast_test28_weekly = prediction(4, X_test28_weekly, y_test_point28_weekly)
+write.csv(data.frame(point_forecast_test28_weekly[1]),"point_forecast_test28_weekly.csv", row.names = FALSE)
+```
+
+```{r}
+datatable(read.csv(file='./point_forecast_test28_weekly.csv'))
+```
+
+### Prediction Accuracy of 28 Days in the testing set
+
+```{r eval=FALSE, message=FALSE}
+prediction_point_test28_weekly = rbind(data.frame(point_forecast_test28_weekly[2]),(data.frame(point_forecast_test28_weekly[2])[3,]+data.frame(point_forecast_test28_weekly[2])[6,])/2)
+rownames(prediction_point_test28_weekly)[12] = 'ses&sarima'
+write.csv(prediction_point_test28_weekly,"prediction_point_test28_weekly.csv", row.names = FALSE)
+```
+
+```{r eval=FALSE, message=FALSE}
+library(Metrics)
+metric_test28_weekly = evaluation(extract_y(y_test_point28_weekly,2,19), prediction_point_test28_weekly, extract_y(y_test_hist28_weekly,2,19))
+datatable(metric_test28_weekly)
+devtools::unload("Metrics")
+write.csv(metric_test28_weekly,"metric_test28_weekly.csv", row.names = TRUE)
+```
+
+```{r}
+datatable(read.csv(file='./metric_test28_weekly.csv',row.names = 1))
+```
+
+## Probabilistic Forecast
+
+Here we consider the probabilistic forecasts of i. Naive  ii. Seasonal Naive (sNaive)  iii. Simple Exponential Smoothing (SES) iv. Exponential Smoothing (ES) v. AutoRegressive Integrated Moving Average (ARIMA) and vi. Kernel density estimate (Kernel) 
+
+- Define the probability predicting function
+
+```{r}
+prob_pred = function(X, h, y_tru, y_hist){
+  
+  overall_prob_pred = data.frame()
+  for (col in 2:19){
+  prob_predictions = data.frame()
+  
+  qlist = c(0.005, 0.025, 0.165, 0.25, 0.5, 0.75, 0.835, 0.975, 0.995)
+  x = ts(X[,col], frequency = 7)
+  
+  # Naive
+  naivef = naive(x, h = h, level = c(50, 67, 95, 99), lambda = 'auto')
+  naivef = data.frame(cbind(naivef$lower[,4], naivef$lower[,3], naivef$lower[,2], naivef$lower[,1],
+                            naivef$mean,
+                            naivef$upper[,1], naivef$upper[,2], naivef$upper[,3], naivef$upper[,4]))
+  colnames(naivef) = paste0("q",qlist)
+  for (qid in 1:ncol(naivef)){
+    for (hid in 1:nrow(naivef)){
+      naivef[hid,qid] = max(0,naivef[hid,qid])
+    }
+  }
+  naivef = data.frame(as.numeric(unlist(naivef)), 
+                      rep(c(1:h),9), 
+                      unlist(lapply(c(1:9), function(x) rep(qlist[x],h))))
+  colnames(naivef) = c("Naive", "h", "quantile")
+  
+  # sNaive
+  snaivef = snaive(x, h = h, level = c(50, 67, 95, 99), lambda = 'auto')
+  snaivef = data.frame(cbind(snaivef$lower[,4], snaivef$lower[,3], snaivef$lower[,2], snaivef$lower[,1],
+                             snaivef$mean,
+                             snaivef$upper[,1], snaivef$upper[,2], snaivef$upper[,3], snaivef$upper[,4]))
+  colnames(snaivef) = paste0("q",qlist)
+  for (qid in 1:ncol(snaivef)){
+    for (hid in 1:nrow(snaivef)){
+      snaivef[hid,qid] = max(0,snaivef[hid,qid])
+    }
+  }
+  snaivef = data.frame(as.numeric(unlist(snaivef)), 
+                       rep(c(1:h),9), 
+                       unlist(lapply(c(1:9), function(x) rep(qlist[x],h))))
+  colnames(snaivef) = c("sNaive", "h", "quantile")
+  
+  # SES
+  sesf = ses(x, h = h, level = c(50, 67, 95, 99), lambda = 'auto')
+  sesf = data.frame(cbind(sesf$lower[,4], sesf$lower[,3], sesf$lower[,2], sesf$lower[,1],
+                          sesf$mean,
+                          sesf$upper[,1], sesf$upper[,2], sesf$upper[,3],sesf$upper[,4]))
+  colnames(sesf) = paste0("q",qlist)
+  for (qid in 1:ncol(sesf)){
+    for (hid in 1:nrow(sesf)){
+      sesf[hid,qid] = max(0,sesf[hid,qid])
+    }
+  }
+  sesf = data.frame(as.numeric(unlist(sesf)), 
+                    rep(c(1:h),9), 
+                    unlist(lapply(c(1:9), function(x) rep(qlist[x],h))))
+  colnames(sesf) = c("SES", "h", "quantile")
+  
+  # ETS
+  etsf = forecast(ets(x, lambda = 'auto'), h = h, level = c(50, 67, 95, 99))
+  etsf = data.frame(cbind(etsf$lower[,4], etsf$lower[,3], etsf$lower[,2], etsf$lower[,1],
+                          etsf$mean,
+                          etsf$upper[,1], etsf$upper[,2], etsf$upper[,3], etsf$upper[,4]))
+  colnames(etsf) = paste0("q",qlist)
+  for (qid in 1:ncol(etsf)){
+    for (hid in 1:nrow(etsf)){
+      etsf[hid,qid] = max(0,etsf[hid,qid])
+    }
+  }
+  etsf = data.frame(as.numeric(unlist(etsf)), 
+                    rep(c(1:h),9), 
+                    unlist(lapply(c(1:9), function(x) rep(qlist[x],h))))
+  colnames(etsf) = c("ETS", "h", "quantile")
+  
+  # ARIMA
+  arimaf = forecast :: forecast(auto.arima(x, lambda = 'auto'), h = h, level = c(50, 67, 95, 99))
+  arimaf = data.frame(cbind(arimaf$lower[,4], arimaf$lower[,3], arimaf$lower[,2], arimaf$lower[,1],
+                            arimaf$mean,
+                            arimaf$upper[,1], arimaf$upper[,2], arimaf$upper[,3], arimaf$upper[,4]))
+  colnames(arimaf) = paste0("q",qlist)
+  for (qid in 1:ncol(arimaf)){
+    for (hid in 1:nrow(arimaf)){
+      arimaf[hid,qid] = max(0,arimaf[hid,qid])
+    }
+  }
+  arimaf = data.frame(as.numeric(unlist(arimaf)), 
+                      rep(c(1:h),9), 
+                      unlist(lapply(c(1:9), function(x) rep(qlist[x],h))))
+  colnames(arimaf) = c("ARIMA", "h", "quantile")
+  
+  # Kernel 
+  quants = as.numeric(quantile(x,qlist))
+  kernelf = data.frame(cbind(rep(quants[1],h), rep(quants[2],h), rep(quants[3],h),
+                             rep(quants[4],h), rep(quants[5],h), rep(quants[6],h),
+                             rep(quants[7],h), rep(quants[8],h), rep(quants[9],h)))
+  colnames(kernelf) = paste0("q",qlist)
+  kernelf = data.frame(as.numeric(unlist(kernelf)), 
+                       rep(c(1:h),9), 
+                       unlist(lapply(c(1:9), function(x) rep(qlist[x],h))))
+  colnames(kernelf) = c("Kernel", "h", "quantile")
+  
+  prob_predictions = merge(naivef, snaivef, by=c("h", "quantile"))
+  prob_predictions = merge(prob_predictions, sesf, by=c("h", "quantile"))
+  prob_predictions = merge(prob_predictions, etsf, by=c("h", "quantile"))
+  prob_predictions = merge(prob_predictions, arimaf, by=c("h", "quantile"))
+  prob_predictions = merge(prob_predictions, kernelf, by=c("h", "quantile"))
+  
+  prob_predictions$ts = colnames(X)[col]
+  prob_predictions$ground_truth = as.double(y_tru[col])
+  prob_predictions$hist = as.double(y_hist[col])
+  print(col)
+  overall_prob_pred = rbind(overall_prob_pred, prob_predictions)}
+  return (overall_prob_pred)
+}
+```
+
+- Define Scaled Pinball Loss (SPL)
+```{r}
+spl = function(ground_truth, history, quantile_preds, quantile){
+  loss = sum(
+    (
+      (ground_truth-quantile_preds)*(ground_truth>=quantile_preds)*quantile
+    )
+    +
+      (
+        (quantile_preds-ground_truth)*(quantile_preds>ground_truth)*(1-quantile)
+      )
+  )/length(quantile_preds)
+  
+  scale = mean(abs(diff(history)))
+  
+  spl = loss/scale
+  
+  return (spl)}
+```
+
+```{r eval=FALSE, message=FALSE}
+prob_train = prob_pred(X_train,1, y_train_point, y_train_hist)
+prob_test = prob_pred(X_test,1, y_test_point, y_test_hist)
+```
+
+```{r eval=FALSE, message=FALSE}
+overall_probs = list(prob_train, prob_test)
+
+metric_prob = data.frame()
+for (overall_prob_pred in overall_probs){
+
+spl_score = c()
+for (col in 3:8) {
+  spl_score = append(spl_score, (spl(overall_prob_pred[,10], overall_prob_pred[,11], overall_prob_pred[,col],overall_prob_pred[,2])))
+ 
+}
+metric_prob = rbind(metric_prob, spl_score)}
+colnames(metric_prob) = colnames(prob_train)[3:8]
+rownames(metric_prob) = c('Training', 'Testing')
+write.csv(metric_prob,"metric_prob.csv")
+
+```
+
+We assess the result using the Scaled Pinball Loss (SPL) function, and we find that on the training set the ETS method has the lowest SP Loss, and it performs well on the testing set.
+However, the Naive method does not perform well on the training set, but it has the lowest loss on the testing set.	
+
+```{r}
+datatable(read.csv(file='./metric_prob.csv',row.names = 1))
+```
+
+
+## Multivariate Time Series - VAR Model
+
+n this section we also created two functions, the VAR function and its evaluation function. To know why the VAR model should work, we notice that since there are 18 time series, there might be some possibilities that some or all of these time series could influence each other when making predictions. For example, in store 1, the sales of the Hobbies products might also influence the sales of Household or Foods. Or take another example, the sales of the Hobbies products in store 1 might also impact the sales of same products in store 2 or 3, or vice versa. So the VAR model is introduced to solve this problem. 	
+
+- Define VAR forecasting and evaluation function
+
+```{r}
+VAR_fc = function(Xs,h){
+    y_var = c()
+for (x in Xs){
+    vs = VARselect(x, lag.max=10)
+    var = VAR(x, p=vs$selection[2])
+    var.fc = predict(var, n.ahead=h)$fcst
+    fc = data.frame()
+    for (i in 1:length(var.fc)){
+    fc = rbind(fc, setNames(data.frame(var.fc[i]),c('fcst','lower','upper','CI')))}
+    y_var = append(y_var, fc$fcst)
+}
+return (y_var)
+}
+
+evaluation_var = function(ground_truth, predictions, history){
+    metric = data.frame()
+    ev = c(rmse(ground_truth, predictions), mae(ground_truth, predictions), mape(ground_truth, predictions), mase(ground_truth, predictions), rmsse(ground_truth, predictions, history))
+    metric = rbind(metric, ev)
+    
+    colnames(metric) = c('RMSE', 'MAE', 'MAPE', 'MASE', 'RMSSE')
+    rownames(metric) = as.character(substitute(predictions))
+    return (metric)}
+```
+
+### By Store
+
+- Define training & testing sets
+
+```{r}
+X_train_store1 = X_train[, 2:7]
+y_train_point_store1 = y_train_point[, 2:7]
+X_train28_store1 =  X_train28[, 2:7]
+y_train_point28_store1 = y_train_point28[, 2:7]
+X_test_store1 = X_test[,2:7]
+y_test_point_store1 = y_test_point[, 2:7]
+X_test28_store1 = X_test28[,2:7]
+y_test_point28_store1 = y_test_point28[, 2:7]
+
+X_train_store2 = X_train[, 8:13]
+y_train_point_store2 = y_train_point[, 8:13]
+X_train28_store2 =  X_train28[, 8:13]
+y_train_point28_store2 = y_train_point28[, 8:13]
+X_test_store2 = X_test[,8:13]
+y_test_point_store2 = y_test_point[, 8:13]
+X_test28_store2 = X_test28[,8:13]
+y_test_point28_store2 = y_test_point28[, 8:13]
+
+X_train_store3 = X_train[, 14:19]
+y_train_point_store3 = y_train_point[, 14:19]
+X_train28_store3 =  X_train28[, 14:19]
+y_train_point28_store3 = y_train_point28[, 14:19]
+X_test_store3 = X_test[,14:19]
+y_test_point_store3 = y_test_point[, 14:19]
+X_test28_store3 = X_test28[,14:19]
+y_test_point28_store3 = y_test_point28[, 14:19]
+```
+
+#### Predicting with VAR by Store
+
+```{r}
+Xs_train_store_point = list(X_train_store1,X_train_store2,X_train_store3)
+VAR_train_store_point = VAR_fc(Xs_train_store_point, 1)
+Xs_test_store_point = list(X_test_store1,X_test_store2,X_test_store3)
+VAR_test_store_point = VAR_fc(Xs_test_store_point, 1)
+
+
+
+Xs_train28_store_point = list(X_train28_store1,X_train28_store2,X_train28_store3)
+VAR_train28_store_point = VAR_fc(Xs_train28_store_point, 28)
+Xs_test28_store_point = list(X_test28_store1,X_test28_store2,X_test28_store3)
+VAR_test28_store_point = VAR_fc(Xs_test28_store_point, 28)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(Metrics)
+metric_var_train_store_point = evaluation_var(extract_y(y_train_point,2,19), VAR_train_store_point, extract_y(y_train_hist,2,19))
+metric_var_test_store_point = evaluation_var(extract_y(y_test_point,2,19), VAR_test_store_point, extract_y(y_test_hist,2,19))
+metric_var_train28_store_point = evaluation_var(extract_y(y_train_point28,2,19), VAR_train28_store_point, extract_y(y_train_hist28,2,19))
+metric_var_test28_store_point = evaluation_var(extract_y(y_test_point28,2,19), VAR_test28_store_point, extract_y(y_test_hist28,2,19))
+metrics_var_store = rbind(metric_var_train_store_point, metric_var_test_store_point, metric_var_train28_store_point, metric_var_test28_store_point)
+devtools::unload("Metrics")
+```
+
+On the aspect of stores, we found that for the one-step ahead point forecast the RMSSE in the training and test subsample are only 0.5 and 0.68; And for 28 days ahead predictions, the performance is 0.74 and 1.11 on training and test subdatasets. 
+
+```{r}
+datatable(metrics_var_store)
+```
+
+
+### By Product
+
+```{r}
+## Hobbyies
+X_train_hob1 = X_train[, c(2,8,14)]
+y_train_point_hob1 = y_train_point[, c(2,8,14)]
+X_train28_hob1 =  X_train28[, c(2,8,14)]
+y_train_point28_hob1 = y_train_point28[,c(2,8,14)]
+X_test_hob1 = X_test[,c(2,8,14)]
+y_test_point_hob1 = y_test_point[, c(2,8,14)]
+X_test28_hob1 = X_test28[,c(2,8,14)]
+y_test_point28_hob1 = y_test_point28[, c(2,8,14)]
+## Household_1
+X_train_house1 = X_train[, c(3,9,15)]
+y_train_point_house1 = y_train_point[, c(3,9,15)]
+X_train28_house1 =  X_train28[, c(3,9,15)]
+y_train_point28_house1 = y_train_point28[,c(3,9,15)]
+X_test_house1 = X_test[,c(3,9,15)]
+y_test_point_house1 = y_test_point[, c(3,9,15)]
+X_test28_house1 = X_test28[,c(3,9,15)]
+y_test_point28_house1 = y_test_point28[, c(3,9,15)]
+## Household_2
+X_train_house2 = X_train[, c(4,10,16)]
+y_train_point_house2 = y_train_point[, c(4,10,16)]
+X_train28_house2 =  X_train28[, c(4,10,16)]
+y_train_point28_house2 = y_train_point28[,c(4,10,16)]
+X_test_house2 = X_test[,c(4,10,16)]
+y_test_point_house2 = y_test_point[, c(4,10,16)]
+X_test28_house2 = X_test28[,c(4,10,16)]
+y_test_point28_house2 = y_test_point28[, c(4,10,16)]
+## Food_1
+X_train_food1 = X_train[, c(5,11,17)]
+y_train_point_food1 = y_train_point[, c(5,11,17)]
+X_train28_food1 =  X_train28[, c(5,11,17)]
+y_train_point28_food1 = y_train_point28[,c(5,11,17)]
+X_test_food1 = X_test[,c(5,11,17)]
+y_test_point_food1 = y_test_point[, c(5,11,17)]
+X_test28_food1 = X_test28[,c(5,11,17)]
+y_test_point28_food1 = y_test_point28[, c(5,11,17)]
+
+## Food_2
+X_train_food2 = X_train[, c(6,12,18)]
+y_train_point_food2 = y_train_point[, c(6,12,18)]
+X_train28_food2 =  X_train28[, c(6,12,18)]
+y_train_point28_food2 = y_train_point28[,c(6,12,18)]
+X_test_food2 = X_test[,c(6,12,18)]
+y_test_point_food2 = y_test_point[, c(6,12,18)]
+X_test28_food2 = X_test28[,c(6,12,18)]
+y_test_point28_food2 = y_test_point28[, c(6,12,18)]
+
+## Food_3
+X_train_food3 = X_train[, c(7,13,19)]
+y_train_point_food3 = y_train_point[, c(7,13,19)]
+X_train28_food3 =  X_train28[, c(7,13,19)]
+y_train_point28_food3 = y_train_point28[,c(7,13,19)]
+X_test_food3 = X_test[,c(7,13,19)]
+y_test_point_food3 = y_test_point[, c(7,13,19)]
+X_test28_food3 = X_test28[,c(7,13,19)]
+y_test_point28_food3 = y_test_point28[, c(7,13,19)]
+```
+
+```{r}
+Xs_train_product_point = list(X_train_hob1,X_train_house1,X_train_house2,X_train_food1,X_train_food2,X_train_food3)
+VAR_train_product_point = VAR_fc(Xs_train_product_point, 1)
+Xs_test_product_point = list(X_test_hob1,X_test_house1,X_test_house2,X_test_food1,X_test_food2,X_test_food3)
+VAR_test_product_point = VAR_fc(Xs_test_product_point, 1)
+
+Xs_train28_product_point = list(X_train28_hob1,X_train28_house1,X_train28_house2,X_train28_food1,X_train28_food2,X_train28_food3)
+VAR_train28_product_point = VAR_fc(Xs_train28_product_point, 28)
+Xs_test28_product_point = list(X_test28_hob1,X_test28_house1,X_test28_house2,X_test28_food1,X_test28_food2,X_test28_food3)
+VAR_test28_product_point = VAR_fc(Xs_test28_product_point, 28)
+```
+
+```{r message=FALSE}
+library(Metrics)
+metric_var_train_product_point = evaluation_var(extract_y(y_train_point,2,19), VAR_train_product_point, extract_y(y_train_hist,2,19))
+metric_var_test_product_point = evaluation_var(extract_y(y_test_point,2,19), VAR_test_product_point, extract_y(y_test_hist,2,19))
+metric_var_train28_product_point = evaluation_var(extract_y(y_train_point28,2,19), VAR_train28_product_point, extract_y(y_train_hist28,2,19))
+metric_var_test28_product_point = evaluation_var(extract_y(y_test_point28,2,19), VAR_test28_product_point, extract_y(y_test_hist28,2,19))
+metrics_var_product = rbind(metric_var_train_product_point, metric_var_test_product_point, metric_var_train28_product_point, metric_var_test28_product_point)
+
+devtools::unload("Metrics")
+```
+
+On the aspect of items, the result shows that the RMSSE on the training and test subset for one-step ahead are 3.64 and 9.57. And the performance on the 28 days predictions is relatively close to the one-step ahead prediction. 	
+
+```{r}
+datatable(metrics_var_product)
+```
+
+### Global VAR
+
+```{r}
+Xs_train_point = list(X_train[,2:19])
+VAR_train_point = VAR_fc(Xs_train_point, 1)
+Xs_test_point = list(X_test[,2:19])
+VAR_test_point = VAR_fc(Xs_test_point, 1)
+
+Xs_train28_point = list(X_train28[,2:19])
+VAR_train28_point = VAR_fc(Xs_train28_point, 28)
+Xs_test28_point = list(X_test28[,2:19])
+VAR_test28_point = VAR_fc(Xs_test28_point, 28)
+```
+
+```{r message=FALSE}
+library(Metrics)
+metric_var_train_point = evaluation_var(extract_y(y_train_point,2,19), VAR_train_point, extract_y(y_train_hist,2,19))
+metric_var_test_point = evaluation_var(extract_y(y_test_point,2,19), VAR_test_point, extract_y(y_test_hist,2,19))
+metric_var_train28_point = evaluation_var(extract_y(y_train_point28,2,19), VAR_train28_point, extract_y(y_train_hist28,2,19))
+metric_var_test28_point = evaluation_var(extract_y(y_test_point28,2,19), VAR_test28_point, extract_y(y_test_hist28,2,19))
+metrics_var = rbind(metric_var_train_point, metric_var_test_point, metric_var_train28_point, metric_var_test28_point)
+
+devtools::unload("Metrics")
+```
+
+Considering all the variables, the results show that the VAR model is meaningful: The RMSSE on the training and test subset for one day prediction are 0.54 and 0.86, whereas for 28 days prediction they are 1.07 and 1.1. 
+
+```{r}
+datatable(metrics_var)
+```
+
+
+We can then conclude that there are positive correlations among the sales of different products in the same store but less so for the sales of the same products in different stores. The VAR model works for the combination of product time series and also for all the separate variables.	The cannibalization effect does need to be taken into account while predicting retail data of specific products, especially in physical stores, as well as in the global market.
+
+## Machine Learning & Deep Learning
+
+```{r}
+
+set.seed(42)
+randtest = sample(1:35424,7085)
+trans_data = t(data[,2:19])
+colnames(trans_data) = paste0('t',1:ncol(trans_data))
+rfdata = trans_data[,1:2]
+for (col in 2:1968){
+part = trans_data[, col:(col+1)]
+rfdata = rbind(rfdata, part)
+}
+trainrf = rfdata[-randtest, ]
+valrf = rfdata[randtest, ]
+xtestrf = data.frame(trans_data[,1968])
+xtrain_rf = data.frame(trainrf[,1])
+
+xval_rf = data.frame(valrf[,1])
+
+colnames(xval_rf) = colnames(xtrain_rf)
+colnames(xtestrf) = colnames(xtrain_rf)
+
+rfreg = randomForest(formula = trainrf[,2] ~., data = xtrain_rf, ntree=100)
+y_pred_rf = predict(rfreg, newdata = xval_rf)
+
+```
+
+```{r message=FALSE, warning=FALSE}
+library(Metrics)
+yval_rf = as.array(data.frame(valrf[,2])[,1])
+evaluation_var_rf_validation = evaluation_var(yval_rf, y_pred_rf, xval_rf)
+```
+
+In this section we adopted the random forest model with the number of trees set at 100 in machine learning. The results show that the RMSSE on the training and test subset are only 0.17 and 0.13 respectively, much lower than the VAR models in section 2 or the multiple models we adopted in the first part. So our conclusion is that the machine learning techniques with standard techniques helped.
+
+```{r}
+datatable(evaluation_var_rf_validation[,-5])
+```
+
+```{r}
+ytestrf = as.array(data.frame(trans_data[,1969])[,1])
+y_pred_rf_test = predict(rfreg, newdata = xtestrf)
+y_ses_rf = as.numeric((y_pred_rf_test + read.csv(file='./prediction_point_test.csv')[3,])/2)
+evaluation_var_rf_test = evaluation_var(ytestrf, y_pred_rf_test, xtestrf)
+evaluation_var_ses_rf_test = evaluation_var(ytestrf, y_ses_rf, xtestrf)
+evaluation_var_rf_test = rbind(evaluation_var_rf_test, evaluation_var_ses_rf_test) 
+```
+
+In the testing set, we also discovered that a combination of machine learning models and time series analytic technique could yield a better result. The one-point forecast has the lowest RMSE compared to other tested models except for VARs. 
+
+```{r}
+datatable(evaluation_var_rf_test[,-5])
+```
